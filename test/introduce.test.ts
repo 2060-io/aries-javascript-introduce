@@ -1,0 +1,159 @@
+import { agentDependencies } from '@aries-framework/node'
+import { AskarModule } from '@aries-framework/askar'
+import { ariesAskar } from '@hyperledger/aries-askar-nodejs'
+import { Agent, ConnectionRecord, ConsoleLogger, EncryptedMessage, LogLevel } from '@aries-framework/core'
+import { v4 as uuid } from 'uuid'
+import { firstValueFrom, ReplaySubject, Subject } from 'rxjs'
+import { IntroduceModule } from '../src/IntroduceModule'
+import { IntroduceRecord } from '../src/repository'
+import { SubjectOutboundTransport } from './transport/SubjectOutboundTransport'
+import { SubjectInboundTransport } from './transport/SubjectInboundTransport'
+import { recordsAddedByType } from './recordUtils'
+
+const logger = new ConsoleLogger(LogLevel.debug)
+
+export type SubjectMessage = {
+  message: EncryptedMessage
+  replySubject?: Subject<SubjectMessage>
+}
+
+describe('media test', () => {
+  let aliceAgent: Agent<{ introduce: IntroduceModule }>
+  let bobAgent: Agent<{ introduce: IntroduceModule }>
+  let aliceWalletId: string
+  let aliceWalletKey: string
+  let bobWalletId: string
+  let bobWalletKey: string
+  let aliceConnectionRecord: ConnectionRecord | undefined
+  let bobConnectionRecord: ConnectionRecord | undefined
+
+  beforeEach(async () => {
+    aliceWalletId = uuid()
+    aliceWalletKey = uuid()
+    bobWalletId = uuid()
+    bobWalletKey = uuid()
+
+    const aliceMessages = new Subject<SubjectMessage>()
+    const bobMessages = new Subject<SubjectMessage>()
+
+    const subjectMap = {
+      'rxjs:alice': aliceMessages,
+      'rxjs:bob': bobMessages,
+    }
+
+    // Initialize alice
+    aliceAgent = new Agent({
+      config: {
+        label: 'alice',
+        endpoints: ['rxjs:alice'],
+        walletConfig: { id: aliceWalletId, key: aliceWalletKey },
+        logger,
+      },
+      dependencies: agentDependencies,
+      modules: { askar: new AskarModule({ ariesAskar }), introduce: new IntroduceModule() },
+    })
+
+    aliceAgent.registerOutboundTransport(new SubjectOutboundTransport(subjectMap))
+    aliceAgent.registerInboundTransport(new SubjectInboundTransport(aliceMessages))
+    await aliceAgent.initialize()
+
+    // Initialize bob
+    bobAgent = new Agent({
+      config: {
+        endpoints: ['rxjs:bob'],
+        label: 'bob',
+        walletConfig: { id: bobWalletId, key: bobWalletKey },
+        logger,
+      },
+      dependencies: agentDependencies,
+      modules: { askar: new AskarModule({ ariesAskar }), introduce: new IntroduceModule() },
+    })
+
+    bobAgent.registerOutboundTransport(new SubjectOutboundTransport(subjectMap))
+    bobAgent.registerInboundTransport(new SubjectInboundTransport(bobMessages))
+    await bobAgent.initialize()
+
+    const outOfBandRecord = await aliceAgent.oob.createInvitation({
+      autoAcceptConnection: true,
+    })
+
+    let { connectionRecord } = await bobAgent.oob.receiveInvitationFromUrl(
+      outOfBandRecord.outOfBandInvitation.toUrl({
+        domain: 'https://example.com/ssi',
+      }),
+      { autoAcceptConnection: true }
+    )
+
+    bobConnectionRecord = await bobAgent.connections.returnWhenIsConnected(connectionRecord!.id)
+    aliceConnectionRecord = (await aliceAgent.connections.findAllByOutOfBandId(outOfBandRecord.id))[0]
+    aliceConnectionRecord = await aliceAgent.connections.returnWhenIsConnected(aliceConnectionRecord!.id)
+  })
+
+  afterEach(async () => {
+    // Wait for messages to flush out
+    await new Promise((r) => setTimeout(r, 1000))
+
+    if (aliceAgent) {
+      await aliceAgent.shutdown()
+
+      if (aliceAgent.wallet.isInitialized && aliceAgent.wallet.isProvisioned) {
+        await aliceAgent.wallet.delete()
+      }
+    }
+
+    if (bobAgent) {
+      await bobAgent.shutdown()
+
+      if (bobAgent.wallet.isInitialized && bobAgent.wallet.isProvisioned) {
+        await bobAgent.wallet.delete()
+      }
+    }
+  })
+
+  test('Create media and share it', async () => {
+    const subjectAlice = new ReplaySubject<IntroduceRecord>()
+    const subjectBob = new ReplaySubject<IntroduceRecord>()
+    recordsAddedByType(aliceAgent, IntroduceRecord).pipe().subscribe(subjectAlice)
+
+    const aliceRecord = await aliceAgent.modules.introduce.create({
+      connectionId: aliceConnectionRecord!.id,
+      metadata: {
+        metadataKey1: 'metadata-val',
+        metadataKey2: { key21: 'value21', key22: 'value22' },
+      },
+    })
+
+    expect(aliceRecord.metadata.get('metadataKey1')).toEqual('metadata-val')
+    expect(aliceRecord.metadata.get('metadataKey2')).toMatchObject({
+      key21: 'value21',
+      key22: 'value22',
+    })
+
+    await aliceAgent.modules.introduce.share({
+      recordId: aliceRecord.id,
+      items: [{ mimeType: 'image/png', uri: 'http://blabla', metadata: { duration: 14 } }],
+    })
+
+    recordsAddedByType(bobAgent, IntroduceRecord)
+      //.pipe(filter((e) => e.state === IntroduceState.))
+      .subscribe(subjectBob)
+
+    const bobRecord = await firstValueFrom(subjectBob)
+    await firstValueFrom(subjectAlice)
+
+    expect(bobRecord.items?.length).toBe(1)
+    expect(bobRecord.items![0].mimeType).toBe('image/png')
+    expect(bobRecord.items![0].uri).toBe('http://blabla')
+    expect(bobRecord.items![0].metadata!.duration).toBe(14)
+
+    // Now retrieve from repository
+    const recordFromRepo = await bobAgent.modules.media.findById(bobRecord.id)
+    expect(recordFromRepo).toBeDefined()
+    expect(recordFromRepo!.items?.length).toBe(1)
+
+    const item = recordFromRepo!.items![0]
+    expect(item.mimeType).toBe('image/png')
+    expect(item.uri).toBe('http://blabla')
+    expect(item.metadata!.duration).toBe(14)
+  })
+})
